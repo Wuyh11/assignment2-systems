@@ -132,54 +132,37 @@ def flash_fwd_kernel(
 
 @torch.compile
 def _flash_attention_backward_logic(Q, K, V, O, dO, L, sm_scale, is_causal):
-    """
-    使用 PyTorch 和 torch.compile 实现的 FlashAttention-2 反向传播逻辑。
-    对应 PDF 中的 Equations 13-19。
-    """
-    # 维度: [batch_size, n_heads, seq_len, head_dim]
-    # L 维度: [batch_size, n_heads, seq_len]
-    
-    # 1. 重新计算 Attention Scores S
-    # Equation 13: S = QK^T / sqrt(d)
+    # 重新计算 Attention Scores S
+    # S = QK^T / sqrt(d)
     S = torch.matmul(Q, K.transpose(-2, -1)) * sm_scale
     
-    # 如果是 causal，需要重新应用 mask，否则 P 计算会出错
     if is_causal:
         seq_len = Q.shape[-2]
+        # 注意：这里要确保 mask 的 device 和 Q 一致
         mask = torch.triu(torch.ones((seq_len, seq_len), device=Q.device, dtype=torch.bool), diagonal=1)
         S = S.masked_fill(mask, float("-inf"))
 
-    # 2. 重新计算 Attention Probabilities P
-    # Equation 14: P_ij = exp(S_ij - L_i)
-    # L 的维度是 [B, H, N]，S 是 [B, H, N, N]，需要 unsqueeze L 以进行广播
-    P = torch.exp(S - L.unsqueeze(-1)).to(Q.dtype) # 保持精度一致
+    # P = exp(S - L)
+    # L 维度是 [B, H, N]，需 unsqueeze 变为 [B, H, N, 1]
+    P = torch.exp(S - L.unsqueeze(-1)).to(Q.dtype)
 
-    # 3. 计算 D
-    # Equation (Text above 13): D = rowsum(dO * O)
-    # dO 和 O 是 [B, H, N, d]，乘积后在最后一维求和得到 [B, H, N]
+    # D = rowsum(dO * O)
     D = torch.sum(dO * O, dim=-1)
 
-    # 4. 计算 dV
-    # Equation 15: dV = P^T dO
+    # dV = P^T dO
     dV = torch.matmul(P.transpose(-2, -1), dO)
 
-    # 5. 计算 dP
-    # Equation 16: dP = dO V^T
-    # 这一步通常隐式包含在 dS 的计算中，但为了清晰我们显式写出逻辑 (或直接合并到下一步)
-    # dO: [B, H, N, d], V^T: [B, H, d, N] -> [B, H, N, N]
+    # dP = dO V^T
     dP = torch.matmul(dO, V.transpose(-2, -1))
 
-    # 6. 计算 dS
-    # Equation 17: dS_ij = P_ij * (dP_ij - D_i)
-    # D 需要 unsqueeze 变成 [B, H, N, 1] 以匹配 dP 的广播
+    # dS = P * (dP - D)
+    # D 需 unsqueeze 变为 [B, H, N, 1]
     dS = P * (dP - D.unsqueeze(-1))
 
-    # 7. 计算 dQ
-    # Equation 18: dQ = dS K / sqrt(d) (scale 因子在这里应用)
+    # dQ = dS K * scale
     dQ = torch.matmul(dS, K) * sm_scale
 
-    # 8. 计算 dK
-    # Equation 19: dK = dS^T Q / sqrt(d)
+    # dK = dS^T Q * scale
     dK = torch.matmul(dS.transpose(-2, -1), Q) * sm_scale
 
     return dQ, dK, dV
@@ -225,6 +208,7 @@ class FlashAttention2ForwardTriton(torch.autograd.Function):
             K_TILE_SIZE = 16
 
         scale = 1.0 / math.sqrt(D)
+        ctx.sm_scale = scale
 
         O = torch.empty_like(Q_)
         L = torch.empty((BH, N), device=Q.device, dtype=torch.float32)
@@ -259,10 +243,11 @@ class FlashAttention2ForwardTriton(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         # 获取保存的 Tensor
-        q, k, v, o, l = ctx.saved_tensors
+        L, Q, K, V, O = ctx.saved_tensors
         
-        # 调用编译后的 PyTorch 反向传播逻辑
+        # 调用帮助函数
         dq, dk, dv = _flash_attention_backward_logic(
-            q, k, v, o, do, l, ctx.sm_scale, ctx.is_causal
+            Q, K, V, O, do, L, ctx.sm_scale, ctx.is_causal
         )
-        return dq, dk, dv, None # None 对应 is_causal 参数
+        
+        return dq, dk, dv, None

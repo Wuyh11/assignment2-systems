@@ -4,7 +4,7 @@ import triton.testing
 import math
 import csv
 import os
-from cs336_systems.flash_attention2_triton import FlashAttentionFunction
+from cs336_systems.flash_attention2_triton import FlashAttention2ForwardTriton
 
 # -----------------------------------------------------------------------------
 # 1. 实现 Baseline 和 Wrapper
@@ -26,7 +26,7 @@ def manual_attention(q, k, v, is_causal=False):
 
 def triton_flash_attention(q, k, v, is_causal=False):
     """调用你的 Triton FlashAttention 实现"""
-    return FlashAttentionFunction.apply(q, k, v, is_causal)
+    return FlashAttention2ForwardTriton.apply(q, k, v, is_causal)
 
 # -----------------------------------------------------------------------------
 # 2. Benchmarking 核心逻辑

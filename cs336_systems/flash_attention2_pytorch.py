@@ -19,7 +19,7 @@ class FlashAttention2ForwardPyTorch(torch.autograd.Function):
     def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal: bool = False):
         # (a) says: you can ignore is_causal for this task.
         # We still accept it to match the required signature.
-        del is_causal
+        ctx.is_causal = is_causal
 
         assert Q.device.type == "cuda" or Q.device.type == "cpu", "Expected a torch Tensor"
         assert Q.dtype == K.dtype == V.dtype, "Q, K, V must have same dtype"
@@ -52,6 +52,7 @@ class FlashAttention2ForwardPyTorch(torch.autograd.Function):
         assert Bq >= 16 and Bk >= 16
 
         scale = 1.0 / math.sqrt(D)
+        ctx.sm_scale = scale
 
         # Allocate outputs (match input dtype for O; L is usually fp32 for stability)
         O = torch.empty((BH, N, D), device=Q_.device, dtype=Q_.dtype)
@@ -119,5 +120,42 @@ class FlashAttention2ForwardPyTorch(torch.autograd.Function):
         return O_view
 
     @staticmethod
-    def backward(ctx, *grad_outputs):
-        raise NotImplementedError("Part (a) only: backward will be implemented in a later problem.")
+    def backward(ctx, do):
+        # 实现 backward，修复 NotImplementedError
+        L, Q, K, V, O = ctx.saved_tensors
+        sm_scale = ctx.sm_scale
+        is_causal = ctx.is_causal
+
+        # -----------------------------------------------------------------
+        # 这里直接复制 _flash_attention_backward_logic 的逻辑即可
+        # -----------------------------------------------------------------
+        
+        # 1. Recompute S
+        S = torch.matmul(Q, K.transpose(-2, -1)) * sm_scale
+        if is_causal:
+            seq_len = Q.shape[-2]
+            mask = torch.triu(torch.ones((seq_len, seq_len), device=Q.device, dtype=torch.bool), diagonal=1)
+            S = S.masked_fill(mask, float("-inf"))
+        
+        # 2. P = exp(S - L)
+        P = torch.exp(S - L.unsqueeze(-1)).to(Q.dtype)
+
+        # 3. D = rowsum(dO * O)
+        D = torch.sum(do * O, dim=-1)
+
+        # 4. dV = P^T dO
+        dV = torch.matmul(P.transpose(-2, -1), do)
+
+        # 5. dP = dO V^T
+        dP = torch.matmul(do, V.transpose(-2, -1))
+
+        # 6. dS = P * (dP - D)
+        dS = P * (dP - D.unsqueeze(-1))
+
+        # 7. dQ = dS K * scale
+        dQ = torch.matmul(dS, K) * sm_scale
+
+        # 8. dK = dS^T Q * scale
+        dK = torch.matmul(dS.transpose(-2, -1), Q) * sm_scale
+
+        return dQ, dK, dV, None
