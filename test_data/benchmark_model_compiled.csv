@@ -1,0 +1,4 @@
+model_size,context_len,vanilla_fwd_s,compiled_fwd_s,vanilla_step_s,compiled_step_s,speedup_step
+medium,128,0.13564,3.40163,0.529973,0.504472,1.05055
+medium,256,0.26225,3.62271,0.910609,0.819026,1.11182
+medium,512,0.571712,3.94686,1.80263,1.51033,1.19354
