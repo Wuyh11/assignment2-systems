@@ -1,0 +1,105 @@
+import os
+import copy
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from cs336_systems.ddp_naive import NaiveDDP
+
+class ToyModel(torch.nn.Module):
+    def __init__(self, d_in=8, d_out=4):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(d_in, 16),
+            torch.nn.ReLU(),
+            torch.nn.Linear(16, d_out),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def _setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29501"
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+
+def _cleanup():
+    dist.destroy_process_group()
+
+
+def ddp_worker(rank, world_size, steps=5, batch_size=32, lr=1e-2, seed=0):
+    _setup(rank, world_size)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    device = torch.device("cuda", rank)
+
+    # rank0 构建模型，其它 rank 会在 NaiveDDP 里广播对齐
+    model = ToyModel().to(device)
+    ddp_model = NaiveDDP(model)
+
+    opt = torch.optim.SGD(ddp_model.parameters(), lr=lr)
+    loss_fn = torch.nn.MSELoss()
+
+    # 固定一份“全局 batch”，然后按 rank 切分（保证与单机训练一致）
+    torch.manual_seed(seed + 123)
+    X_full = torch.randn(batch_size, 8, device=device)
+    Y_full = torch.randn(batch_size, 4, device=device)
+
+    per_rank = batch_size // world_size
+    X = X_full[rank * per_rank : (rank + 1) * per_rank]
+    Y = Y_full[rank * per_rank : (rank + 1) * per_rank]
+
+    for _ in range(steps):
+        opt.zero_grad(set_to_none=True)
+        pred = ddp_model(X)
+        loss = loss_fn(pred, Y)
+        loss.backward()
+        ddp_model.sync_gradients()
+        opt.step()
+
+    # 把 rank0 的参数收集出来用于对比
+    state = {k: v.detach().cpu() for k, v in ddp_model.module.state_dict().items()}
+    if rank == 0:
+        torch.save(state, "ddp_state.pt")
+
+    _cleanup()
+
+
+def run_single(steps=5, batch_size=32, lr=1e-2, seed=0):
+    torch.manual_seed(seed)
+    device = torch.device("cuda", 0)
+    model = ToyModel().to(device)
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    loss_fn = torch.nn.MSELoss()
+
+    torch.manual_seed(seed + 123)
+    X = torch.randn(batch_size, 8, device=device)
+    Y = torch.randn(batch_size, 4, device=device)
+
+    for _ in range(steps):
+        opt.zero_grad(set_to_none=True)
+        pred = model(X)
+        loss = loss_fn(pred, Y)
+        loss.backward()
+        opt.step()
+
+    return {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
+
+if __name__ == "__main__":
+    world_size = 2
+    mp.spawn(ddp_worker, args=(world_size,), nprocs=world_size, join=True)
+
+    single_state = run_single()
+    ddp_state = torch.load("ddp_state.pt", map_location="cpu")
+
+    # 对比
+    max_diff = 0.0
+    for k in single_state:
+        diff = (single_state[k] - ddp_state[k]).abs().max().item()
+        max_diff = max(max_diff, diff)
+    print("max |single - ddp| =", max_diff)
