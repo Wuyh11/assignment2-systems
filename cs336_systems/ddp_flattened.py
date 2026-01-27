@@ -8,41 +8,51 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-# 导入你仓库中的模型定义
+# 引入你的基础模型
 from cs336_basics.model import BasicsTransformerLM
 
-# 导入你仓库中的 DDP 实现
+# 引入三种 DDP 实现
+# 1. Baseline Individual (Naive)
 from cs336_systems.ddp_naive import NaiveDDP
+# 2. Baseline Flattened 
+from cs336_systems.ddp_flattened import MinimalDDPFlat
+# 3. Overlap Individual (异步 overlap)
 from cs336_systems.ddp_overlap_individual_parameters import DDP as DDPOverlapIndividual
 
+
 # ----------------------------
-# 模型构建
+# 1. 模型构建 (TODO 实现)
 # ----------------------------
 def build_xl_model(args, device: torch.device) -> nn.Module:
     """
-    创建 XL 大小的模型 (Config 参考自 benchmark.py)
+    创建 XL 大小的模型。
+    配置参考 benchmark.py 中的 MODEL_CONFIGS["xl"]。
     XL: d_model=1600, d_ff=6400, num_layers=48, num_heads=25
     """
     config = {
-        "d_model": 1600, 
-        "d_ff": 6400, 
-        "num_layers": 48, 
-        "num_heads": 25
+        "d_model": 1600,
+        "d_ff": 6400,
+        "num_layers": 48,
+        "num_heads": 25,
     }
     
+    # 这里的 vocab_size 和 context_length 从 args 读取，
+    # 确保和 benchmark 运行时参数一致
     model = BasicsTransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.seq_len,
         **config,
-        rope_theta=10000.0, # 默认值
+        rope_theta=10000.0, 
     )
     return model.to(device)
 
 
+# ----------------------------
+# 2. 数据生成 (TODO 实现)
+# ----------------------------
 def get_batch(device: torch.device, batch_size: int, seq_len: int, vocab_size: int):
     """
-    生成基准测试用的随机数据。
-    对于系统性能测试，随机数据即可，无需真实加载数据集。
+    生成 benchmark 用的随机数据。
     """
     x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device, dtype=torch.long)
     y = torch.randint(0, vocab_size, (batch_size, seq_len), device=device, dtype=torch.long)
@@ -76,52 +86,52 @@ def _allreduce_max_ms(value_ms: float, device: torch.device) -> float:
 
 
 # ----------------------------
-# 三种 DDP wrapper 的“适配接口”
+# 3. DDP Wrapper 工厂 (TODO 实现)
 # ----------------------------
 def make_ddp_wrapper(mode: str, model: nn.Module):
     """
     返回一个 wrapper 对象 w，满足：
       - w(*inputs, **kwargs) 做 forward
-      - w.finish_gradient_synchronization() (可选) 用于 overlap 模式在 step 前 wait handles
-      - w.module (可选) 指向原始模型（给 optimizer 用也行）
+      - w.finish_gradient_synchronization() (可选) 用于在 step 前显式同步/等待梯度
     """
 
     if mode == "baseline-individual":
-        # 使用 NaiveDDP (cs336_systems/ddp_naive.py)
-        # NaiveDDP 的接口是 sync_gradients()，我们需要将其别名适配为 finish_gradient_synchronization
+        # 1. 逐参数 AllReduce (无 Overlap)
         wrapper = NaiveDDP(model)
+        # NaiveDDP 的同步方法叫 sync_gradients，适配 benchmark 调用的接口名
         wrapper.finish_gradient_synchronization = wrapper.sync_gradients
         return wrapper
 
     if mode == "baseline-flattened":
-        # TODO: 如果你有 flattened DDP 的实现，请在这里导入并返回
-        # 例如: from cs336_systems.ddp_flattened import DDPFlattened
-        # return DDPFlattened(model)
-        raise NotImplementedError("Baseline flattened implementation not found.")
+        # 2. Flatten 后单次 AllReduce (无 Overlap)
+        wrapper = MinimalDDPFlat(model)
+        # MinimalDDPFlat 的同步方法也叫 sync_gradients，进行适配
+        wrapper.finish_gradient_synchronization = wrapper.sync_gradients
+        return wrapper
 
     if mode == "overlap-individual":
-        # 使用 Overlap Individual DDP (cs336_systems/ddp_overlap_individual_parameters.py)
-        # 该类已经实现了 finish_gradient_synchronization()
+        # 3. 逐参数 Async AllReduce (有 Overlap)
+        # 这个类本身已经实现了 finish_gradient_synchronization
         return DDPOverlapIndividual(model)
 
     raise ValueError(f"Unknown mode: {mode}")
 
 
 # ----------------------------
-# 训练 step（统计总耗时 + 通信等待耗时）
+# 训练 step
 # ----------------------------
 def train_one_iter(wrapper, optimizer, loss_fn, batch):
     x, y = batch
 
     def _iter_body():
         optimizer.zero_grad(set_to_none=True)
-        logits = wrapper(x)  # 假设 model forward 只吃 x，输出 logits
+        logits = wrapper(x)  
         loss = loss_fn(logits.view(-1, logits.size(-1)), y.view(-1))
         loss.backward()
 
         comm_wait_ms = 0.0
-        # overlap 模式：通常你需要在 step 前等所有 async allreduce “queued/ready”
-        # baseline 模式：如果是 NaiveDDP，我们也在这里调用同步
+        # 如果 wrapper 需要显式同步（baseline 模式）或者等待 handle（overlap 模式）
+        # 都在这里进行，并计入通信等待时间
         if hasattr(wrapper, "finish_gradient_synchronization"):
             comm_wait_ms = _sync_and_time_ms(wrapper.finish_gradient_synchronization)
 
@@ -149,11 +159,11 @@ def run_benchmark(rank: int, world_size: int, args):
     device = torch.device("cuda", rank)
 
     # --- build model & wrapper ---
-    # 传递 args 以便获取 hidden_size, num_layers 等信息 (如果需要) 或 vocab/seq_len
+    # 传入 args 以获取 shape 信息
     model = build_xl_model(args, device=device)
     wrapper = make_ddp_wrapper(args.mode, model)
 
-    # optimizer：一般用 wrapper.module.parameters() 或 wrapper.parameters()
+    # optimizer
     params = None
     if hasattr(wrapper, "module"):
         params = wrapper.module.parameters()
@@ -163,26 +173,28 @@ def run_benchmark(rank: int, world_size: int, args):
         raise RuntimeError("Wrapper has no parameters() and no .module")
 
     optimizer = torch.optim.AdamW(params, lr=args.lr)
-
-    # loss：假设是 LM logits
     loss_fn = nn.CrossEntropyLoss()
-
-    # 从 args 获取 vocab_size
     vocab_size = getattr(args, "vocab_size", 50304)
 
     # --- warmup ---
+    if rank == 0:
+        print(f"Warmup {args.warmup_iters} iters...")
     for _ in range(args.warmup_iters):
         batch = get_batch(device, args.batch_size, args.seq_len, vocab_size)
         _ = train_one_iter(wrapper, optimizer, loss_fn, batch)
 
     # --- timed iters ---
+    if rank == 0:
+        print(f"Benchmark {args.iters} iters...")
+        
     iter_ms_list = []
     comm_ms_list = []
+    
     for _ in range(args.iters):
         batch = get_batch(device, args.batch_size, args.seq_len, vocab_size)
         timing = train_one_iter(wrapper, optimizer, loss_fn, batch)
 
-        # 取跨 rank max
+        # 统计：取所有 rank 中最慢的作为该次迭代的耗时（模拟同步步调）
         iter_ms = _allreduce_max_ms(timing.iter_ms, device)
         comm_ms = _allreduce_max_ms(timing.comm_wait_ms, device)
         iter_ms_list.append(iter_ms)
@@ -193,13 +205,14 @@ def run_benchmark(rank: int, world_size: int, args):
         import statistics as stats
         mean_iter = stats.mean(iter_ms_list)
         p50_iter = stats.median(iter_ms_list)
-        p95_iter = stats.quantiles(iter_ms_list, n=20)[18]  # 95th ≈ 19/20
+        p95_iter = stats.quantiles(iter_ms_list, n=20)[18]  # 95th
         mean_comm = stats.mean(comm_ms_list)
 
         print(f"\n=== Mode: {args.mode} | world_size={world_size} ===")
         print(f"iters={args.iters} warmup={args.warmup_iters}")
+        print(f"batch_size={args.batch_size} seq_len={args.seq_len}")
         print(f"iter time (ms): mean={mean_iter:.3f}  p50={p50_iter:.3f}  p95={p95_iter:.3f}")
-        print(f"comm-wait (ms): mean={mean_comm:.3f}  (only meaningful if wrapper.finish_gradient_synchronization exists)")
+        print(f"comm-wait (ms): mean={mean_comm:.3f}")
         print("========================================\n")
 
     dist.destroy_process_group()
@@ -209,8 +222,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, required=True,
                         choices=["baseline-individual", "baseline-flattened", "overlap-individual"])
-    parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--warmup-iters", type=int, default=10)
+    parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--warmup-iters", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -220,7 +233,12 @@ def main():
     parser.add_argument("--master-port", type=int, default=29500)
     args = parser.parse_args()
 
+    # 默认 2 卡测试
     world_size = 2
+    if torch.cuda.device_count() < world_size:
+        print(f"Warning: Not enough GPUs ({torch.cuda.device_count()} found), forcing world_size=1 for debugging.")
+        world_size = 1
+
     mp.spawn(run_benchmark, args=(world_size, args), nprocs=world_size, join=True)
 
 
